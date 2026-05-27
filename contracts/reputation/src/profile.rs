@@ -96,17 +96,24 @@ pub struct Profile {
     pub metadata_hash: Option<Bytes>,
     /// Per-tier badge metadata URIs set by the admin.
     pub badge_metadata: soroban_sdk::Vec<BadgeMetadataEntry>,
+    pub transfer_blocked: bool,
 }
 
 impl Profile {
-    pub fn new(address: Address) -> Self {
+    pub fn new(address: Address, env: &soroban_sdk::Env) -> Self {
         Self {
             address,
             client: RoleMetrics::new(),
             freelancer: RoleMetrics::new(),
             is_blacklisted: false,
             metadata_hash: None,
-            badge_metadata: soroban_sdk::Vec::new(_env),
+            badge_metadata: soroban_sdk::Vec::new(env),
+            transfer_blocked: true,
         }
+    }
+
+    pub fn refresh_badges(&mut self) {
+        self.client.badge_level = BadgeLevel::from_score(self.client.score) as u32;
+        self.freelancer.badge_level = BadgeLevel::from_score(self.freelancer.score) as u32;
     }
 }
