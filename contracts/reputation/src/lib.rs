@@ -329,7 +329,7 @@ impl ReputationContract {
             profile.client_badge_level = Self::recalculate_badge_level(new_score, profile.client_jobs);
             (
                 Role::Client,
-                profile.client_points,
+                profile.client_points / 10_000,
                 profile.client_jobs,
                 profile.client_score,
             )
@@ -350,7 +350,7 @@ impl ReputationContract {
             profile.freelancer_badge_level = Self::recalculate_badge_level(new_score, profile.freelancer_jobs);
             (
                 Role::Freelancer,
-                profile.freelancer_points,
+                profile.freelancer_points / 10_000,
                 profile.freelancer_jobs,
                 profile.freelancer_score,
             )
@@ -375,11 +375,7 @@ impl ReputationContract {
                 rating: score,
                 new_score,
                 total_jobs,
-                total_points: if role == Role::Client {
-                    profile.client_points / 10_000
-                } else {
-                    profile.freelancer_points / 10_000
-                },
+                total_points,
                 reviews: total_jobs,
                 updated_at: env.ledger().timestamp(),
             },
