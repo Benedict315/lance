@@ -577,6 +577,71 @@ impl ReputationContract {
             .unwrap_or(false)
     }
 
+    /// Return the current badge level for an address/role pair.
+    pub fn get_badge(env: Env, address: Address, role: Role) -> BadgeLevel {
+        Self::bump_instance_ttl(&env);
+        let profile = storage::read_profile_or_default(&env, &address);
+        match role {
+            Role::Client => profile.client_badge,
+            Role::Freelancer => profile.freelancer_badge,
+        }
+    }
+
+    /// Admin-only: set the decentralised-storage URI for a badge tier.
+    /// `uri` is typically an IPFS CID pointing to the badge image/JSON.
+    pub fn set_badge_metadata(
+        env: Env,
+        admin: Address,
+        address: Address,
+        tier: BadgeTier,
+        uri: Bytes,
+    ) {
+        let configured_admin: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .expect("not initialized");
+        admin.require_auth();
+        assert!(admin == configured_admin, "unauthorized");
+
+        let mut profile = storage::read_profile_or_default(&env, &address);
+
+        // Replace existing entry for this tier or push a new one.
+        let mut found = false;
+        let len = profile.badge_metadata.len();
+        for i in 0..len {
+            let entry = profile.badge_metadata.get(i).unwrap();
+            if entry.tier == tier {
+                profile.badge_metadata.set(i, BadgeMetadataEntry { tier: tier.clone(), uri: uri.clone() });
+                found = true;
+                break;
+            }
+        }
+        if !found {
+            profile.badge_metadata.push_back(BadgeMetadataEntry { tier, uri });
+        }
+
+        storage::write_profile(&env, &address, &profile);
+        Self::bump_instance_ttl(&env);
+    }
+
+    /// Return the metadata URI for a given badge tier, or `None` if not set.
+    pub fn get_badge_metadata(
+        env: Env,
+        address: Address,
+        tier: BadgeTier,
+    ) -> Option<Bytes> {
+        Self::bump_instance_ttl(&env);
+        let profile = storage::read_profile_or_default(&env, &address);
+        for i in 0..profile.badge_metadata.len() {
+            let entry = profile.badge_metadata.get(i).unwrap();
+            if entry.tier == tier {
+                return Some(entry.uri);
+            }
+        }
+        None
+    }
+
     pub fn get_score(env: Env, address: Address, role: Role) -> ReputationScore {
         Self::bump_instance_ttl(&env);
         let profile = storage::read_profile_or_default(&env, &address);
@@ -996,9 +1061,10 @@ mod test {
         let cid = env.register_contract(None, ReputationContract);
         let client = ReputationContractClient::new(&env, &cid);
         client.initialize(&admin);
+        client.set_authorized_contract(&admin, &admin);
 
         // Raise score by 1000 → 5000+1000 = 6000 → Silver
-        client.update_score(&addr, &Role::Freelancer, &1000);
+        client.update_score(&admin, &addr, &Role::Freelancer, &1000);
         let badge = client.get_badge(&addr, &Role::Freelancer);
         assert_eq!(badge, BadgeLevel::Silver);
     }
@@ -1012,8 +1078,9 @@ mod test {
         let cid = env.register_contract(None, ReputationContract);
         let client = ReputationContractClient::new(&env, &cid);
         client.initialize(&admin);
+        client.set_authorized_contract(&admin, &admin);
 
-        client.update_score(&addr, &Role::Freelancer, &3000); // 5000+3000=8000
+        client.update_score(&admin, &addr, &Role::Freelancer, &3000); // 5000+3000=8000
         assert_eq!(client.get_badge(&addr, &Role::Freelancer), BadgeLevel::Gold);
     }
 
@@ -1026,13 +1093,14 @@ mod test {
         let cid = env.register_contract(None, ReputationContract);
         let client = ReputationContractClient::new(&env, &cid);
         client.initialize(&admin);
+        client.set_authorized_contract(&admin, &admin);
 
         // Bring to Gold first, then slash twice to drop back to Bronze
-        client.update_score(&addr, &Role::Client, &3000); // 8000 → Gold
+        client.update_score(&admin, &addr, &Role::Client, &3000); // 8000 → Gold
         assert_eq!(client.get_badge(&addr, &Role::Client), BadgeLevel::Gold);
-        client.slash(&addr, &Role::Client, &soroban_sdk::Symbol::new(&env, "fraud")); // 6000 → Silver
+        client.slash(&admin, &addr, &Role::Client, &soroban_sdk::Symbol::new(&env, "fraud")); // 6000 → Silver
         assert_eq!(client.get_badge(&addr, &Role::Client), BadgeLevel::Silver);
-        client.slash(&addr, &Role::Client, &soroban_sdk::Symbol::new(&env, "fraud")); // 4000 → Bronze
+        client.slash(&admin, &addr, &Role::Client, &soroban_sdk::Symbol::new(&env, "fraud")); // 4000 → Bronze
         assert_eq!(client.get_badge(&addr, &Role::Client), BadgeLevel::Bronze);
     }
 

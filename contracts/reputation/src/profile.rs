@@ -1,4 +1,4 @@
-use soroban_sdk::{contracttype, Address, Bytes};
+use soroban_sdk::{contracttype, Address, Bytes, Env};
 
 #[contracttype]
 #[derive(Clone, Debug, PartialEq)]
@@ -96,17 +96,26 @@ pub struct Profile {
     pub metadata_hash: Option<Bytes>,
     /// Per-tier badge metadata URIs set by the admin.
     pub badge_metadata: soroban_sdk::Vec<BadgeMetadataEntry>,
+    pub client_badge: BadgeLevel,
+    pub freelancer_badge: BadgeLevel,
 }
 
 impl Profile {
-    pub fn new(address: Address) -> Self {
+    pub fn new(env: &Env, address: Address) -> Self {
         Self {
             address,
             client: RoleMetrics::new(),
             freelancer: RoleMetrics::new(),
             is_blacklisted: false,
             metadata_hash: None,
-            badge_metadata: soroban_sdk::Vec::new(_env),
+            badge_metadata: soroban_sdk::Vec::new(env),
+            client_badge: BadgeLevel::Bronze,
+            freelancer_badge: BadgeLevel::Bronze,
         }
+    }
+
+    pub fn refresh_badges(&mut self) {
+        self.client_badge = BadgeLevel::from_score(self.client.score);
+        self.freelancer_badge = BadgeLevel::from_score(self.freelancer.score);
     }
 }
