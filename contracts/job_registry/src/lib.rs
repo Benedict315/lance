@@ -201,6 +201,8 @@ impl JobRegistryContract {
             .get(&bids_key)
             .unwrap_or(Vec::new(&env));
 
+        // Requirement [SC-REG-035]: Enforce strict single-bid constraint per freelancer on active jobs.
+        // Loops through the dynamic bid structures mapped from the Job ID to find duplicate submissions.
         for bid in bids.iter() {
             if bid.freelancer == freelancer {
                 panic_with_error!(&env, JobRegistryError::BidAlreadySubmitted);
@@ -239,6 +241,8 @@ impl JobRegistryContract {
             panic_with_error!(&env, JobRegistryError::JobExpired);
         }
 
+        // Requirement [SC-REG-035]: Strict ownership validation.
+        // Ensures that only the original job creator/client is authorized to accept a proposal.
         if client != job.client {
             panic_with_error!(&env, JobRegistryError::Unauthorized);
         }
@@ -260,6 +264,7 @@ impl JobRegistryContract {
             panic_with_error!(&env, JobRegistryError::BidNotFound);
         }
 
+        // Requirement [SC-REG-035]: Transition registry state cleanly to 'Assigned' (InProgress).
         job.freelancer = Some(freelancer.clone());
         job.status = JobStatus::Assigned;
         env.storage().persistent().set(&key, &job);

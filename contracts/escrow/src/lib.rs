@@ -622,8 +622,7 @@ impl EscrowContract {
         milestone.status = MilestoneStatus::Released;
         job.milestones.set(idx, milestone.clone());
 
-        job.released_amount =
-            Self::checked_add_i128(&env, job.released_amount, milestone.amount)?;
+        job.released_amount = Self::checked_add_i128(&env, job.released_amount, milestone.amount)?;
 
         let next_status = if job.released_amount == job.total_amount {
             EscrowStatus::Completed
@@ -858,6 +857,10 @@ impl EscrowContract {
         let mut job: EscrowJob = env.storage().persistent().get(&key).expect("job not found");
         Self::bump_job_ttl(&env, &key);
         assert!(job.status == EscrowStatus::Disputed, "job not disputed");
+
+        if job.dispute_deadline > 0 && env.ledger().timestamp() > job.dispute_deadline {
+            panic_with_error!(&env, EscrowError::DisputeResolutionExpired);
+        }
 
         let remaining = Self::checked_sub_i128(&env, job.total_amount, job.released_amount)
             .expect("invalid escrow balance state");
@@ -1126,19 +1129,14 @@ impl EscrowContract {
 
     /// Read-only helper exposing active escrow configuration.
     pub fn get_escrow_config(env: Env) -> Result<(Address, Address, Option<Address>), EscrowError> {
-        let admin: Address = env
+        let config: ContractConfig = env
             .storage()
             .instance()
-            .get(&DataKey::Admin)
-            .ok_or(EscrowError::NotInitialized)?;
-        let agent_judge: Address = env
-            .storage()
-            .instance()
-            .get(&DataKey::AgentJudge)
+            .get(&DataKey::Config)
             .ok_or(EscrowError::NotInitialized)?;
         let job_registry: Option<Address> = env.storage().instance().get(&DataKey::JobRegistry);
         Self::bump_instance_ttl(&env);
-        Ok((admin, agent_judge, job_registry))
+        Ok((config.admin, config.agent_judge, job_registry))
     }
 
     /// Read-only helper exposing unreleased escrow balance for a job.
