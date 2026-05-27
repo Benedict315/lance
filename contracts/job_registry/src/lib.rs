@@ -47,6 +47,9 @@ pub struct JobRecord {
     pub status: JobStatus,
 }
 
+// Requirement [SC-REG-036]: Storage Packing for Bid Struct Instance Allocations.
+// Groups `freelancer` address and `proposal_hash` (IPFS CID) into a single packed struct
+// to minimize Soroban ledger footprint and reduce instance/persistent storage write charges.
 #[contracttype]
 #[derive(Clone)]
 pub struct BidRecord {
