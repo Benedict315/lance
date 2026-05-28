@@ -2,6 +2,8 @@ import express, { Express, Request, Response } from "express";
 import cors from "cors";
 import dotenv from "dotenv";
 import { prisma, connectWithRetry, startPoolHealthCheck } from "./config/db";
+import { trace } from "./config/tracing";
+import { intakeRateLimit } from "./middleware/intakeRateLimit";
 import { tracingMiddleware } from "./utils/tracing";
 import authRoutes from "./routes/auth";
 import jobsRoutes from "./routes/jobs";
@@ -12,6 +14,7 @@ import activityRoutes from "./routes/activity";
 import uploadsRoutes from "./routes/uploads";
 import bulkRoutes from "./routes/bulk";
 import poolRoutes from "./routes/pool";
+import stateRoutes from "./routes/state";
 
 dotenv.config();
 
@@ -23,6 +26,7 @@ const logger = trace.getLogger("server");
 app.use(cors({ origin: "*" }));
 app.use(express.json());
 app.use(tracingMiddleware); // Global request tracing and diagnostics
+app.use(intakeRateLimit);
 
 // Request logging middleware with tracing
 app.use((req: Request, res: Response, next) => {
@@ -56,6 +60,7 @@ app.use("/api/v1/activity", activityRoutes);
 app.use("/api/v1/uploads", uploadsRoutes);
 app.use("/api/v1/bulk", bulkRoutes);
 app.use("/api/v1/pool", poolRoutes);
+app.use("/api/v1/state", stateRoutes);
 
 // Health check endpoint with database connectivity verification
 app.get("/health", async (req: Request, res: Response) => {
