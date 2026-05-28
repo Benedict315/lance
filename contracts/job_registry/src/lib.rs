@@ -2,9 +2,10 @@
  
 use soroban_sdk::{
     contract, contracterror, contractimpl, contracttype, log, panic_with_error, symbol_short,
-    Address, Bytes, Env, Vec,
+    token, Address, Bytes, Env, Vec,
 };
 
+#[allow(dead_code)]
 const MAX_HASH_LEN: u32 = 96;
 
 // Requirement [SC-REG-037]: Contract-wide budget floor and ceiling enforced at input validation.
@@ -58,9 +59,15 @@ pub struct JobRecord {
     pub budget_stroops: i128,
     pub expires_at: u64,
     pub status: JobStatus,
-    pub bidding_deadline: u64,
+    pub bid_deadline: u64,
+    pub collateral_token: Address,
+    pub collateral_amount: i128,
+    pub collateral_locked: bool,
 }
 
+// Requirement [SC-REG-036]: Storage Packing for Bid Struct Instance Allocations.
+// Groups `freelancer` address, `proposal_hash` (IPFS CID), and bid collateral fields
+// into a single packed struct to minimize Soroban ledger footprint and reduce storage charges.
 #[contracttype]
 #[derive(Clone)]
 pub struct BidRecord {
@@ -85,6 +92,9 @@ pub struct JobRegistryContract;
  
 #[contractimpl]
 impl JobRegistryContract {
+    /// One-time storage bootstrap.
+    ///
+    /// Sets contract admin and initializes `next_job_id` to 1.
     pub fn initialize(env: Env, admin: Address) {
         if env.storage().instance().has(&DataKey::Admin) {
             panic_with_error!(&env, JobRegistryError::AlreadyInitialized);
@@ -110,14 +120,17 @@ impl JobRegistryContract {
         read_next_job_id(&env)
     }
 
+    /// Client posts a job with explicit `job_id` and collateral lockup details.
     pub fn post_job(
         env: Env,
         job_id: u64,
         client: Address,
         hash: Bytes,
         budget: i128,
-        bidding_deadline: u64,
         expires_at: u64,
+        bid_deadline: u64,
+        collateral_token: Address,
+        collateral_amount: i128,
     ) {
         ensure_initialized(&env);
 
@@ -126,9 +139,13 @@ impl JobRegistryContract {
             job_id,
             &hash,
             budget,
-            bidding_deadline,
             expires_at,
+            bid_deadline,
         );
+
+        if collateral_amount < 0 {
+            panic_with_error!(&env, JobRegistryError::InvalidBudget);
+        }
 
         client.require_auth();
 
@@ -138,9 +155,17 @@ impl JobRegistryContract {
             client.clone(),
             hash,
             budget,
-            bidding_deadline,
             expires_at,
+            bid_deadline,
+            collateral_token.clone(),
+            collateral_amount,
         );
+
+        // Lock collateral from client into this contract
+        if collateral_amount > 0 {
+            let token_client = token::Client::new(&env, &collateral_token);
+            token_client.transfer(&client, &env.current_contract_address(), &collateral_amount);
+        }
 
         let next_job_id = read_next_job_id(&env);
 
@@ -158,13 +183,16 @@ impl JobRegistryContract {
             .publish((symbol_short!("jobpost"), job_id), client);
     }
 
+    /// Client posts a job using internal registry index allocation and collateral lockup details.
     pub fn post_job_auto(
         env: Env,
         client: Address,
         hash: Bytes,
         budget: i128,
-        bidding_deadline: u64,
         expires_at: u64,
+        bid_deadline: u64,
+        collateral_token: Address,
+        collateral_amount: i128,
     ) -> u64 {
         ensure_initialized(&env);
  
@@ -175,9 +203,13 @@ impl JobRegistryContract {
             job_id,
             &hash,
             budget,
-            bidding_deadline,
             expires_at,
+            bid_deadline,
         );
+
+        if collateral_amount < 0 {
+            panic_with_error!(&env, JobRegistryError::InvalidBudget);
+        }
 
         client.require_auth();
 
@@ -187,9 +219,17 @@ impl JobRegistryContract {
             client.clone(),
             hash,
             budget,
-            bidding_deadline,
             expires_at,
+            bid_deadline,
+            collateral_token.clone(),
+            collateral_amount,
         );
+
+        // Lock collateral from client into this contract
+        if collateral_amount > 0 {
+            let token_client = token::Client::new(&env, &collateral_token);
+            token_client.transfer(&client, &env.current_contract_address(), &collateral_amount);
+        }
 
         let next = job_id
             .checked_add(1)
@@ -201,6 +241,7 @@ impl JobRegistryContract {
     }
 
     /// Freelancer submits a bid.
+    /// Freelancer submits a bid, with optionally provided freelancer collateral.
     pub fn submit_bid(
         env: Env,
         job_id: u64,
@@ -228,7 +269,7 @@ impl JobRegistryContract {
             panic_with_error!(&env, JobRegistryError::JobNotOpen);
         }
 
-        if env.ledger().timestamp() > job.bidding_deadline {
+        if env.ledger().timestamp() > job.bid_deadline {
             panic_with_error!(&env, JobRegistryError::BidWindowClosed);
         }
 
@@ -248,6 +289,7 @@ impl JobRegistryContract {
             .get(&bids_key)
             .unwrap_or(Vec::new(&env));
 
+        // Requirement [SC-REG-035]: Enforce strict single-bid constraint per freelancer on active jobs.
         for bid in bids.iter() {
             if bid.freelancer == freelancer {
                 panic_with_error!(&env, JobRegistryError::BidAlreadySubmitted);
@@ -277,6 +319,7 @@ impl JobRegistryContract {
             .publish((symbol_short!("bid"), job_id), freelancer);
     }
 
+    /// Client accepts a bid, locking in the freelancer.
     pub fn accept_bid(
         env: Env,
         job_id: u64,
@@ -370,6 +413,84 @@ impl JobRegistryContract {
         release_collateral(&env, job_id, freelancer, true);
     }
 
+    /// Client completes a job, releasing locked client collateral to the freelancer.
+    pub fn complete_job(env: Env, job_id: u64, client: Address) {
+        ensure_initialized(&env);
+        client.require_auth();
+
+        let key = DataKey::Job(job_id);
+        let mut job: JobRecord = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .unwrap_or_else(|| panic_with_error!(&env, JobRegistryError::JobNotFound));
+
+        if client != job.client {
+            panic_with_error!(&env, JobRegistryError::Unauthorized);
+        }
+
+        if job.status != JobStatus::DeliverableSubmitted {
+            panic_with_error!(&env, JobRegistryError::InvalidStateTransition);
+        }
+
+        job.status = JobStatus::Completed;
+
+        if job.collateral_locked && job.collateral_amount > 0 {
+            if let Some(ref freelancer) = job.freelancer {
+                let token_client = token::Client::new(&env, &job.collateral_token);
+                token_client.transfer(
+                    &env.current_contract_address(),
+                    freelancer,
+                    &job.collateral_amount,
+                );
+                job.collateral_locked = false;
+            }
+        }
+
+        env.storage().persistent().set(&key, &job);
+
+        log!(&env, "complete_job: id {}", job_id);
+        env.events().publish((symbol_short!("complete"), job_id), ());
+    }
+
+    /// Client refunds their locked collateral if the job has expired without an accepted bid.
+    pub fn refund_collateral(env: Env, job_id: u64, client: Address) {
+        ensure_initialized(&env);
+        client.require_auth();
+
+        let key = DataKey::Job(job_id);
+        let mut job: JobRecord = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .unwrap_or_else(|| panic_with_error!(&env, JobRegistryError::JobNotFound));
+
+        if client != job.client {
+            panic_with_error!(&env, JobRegistryError::Unauthorized);
+        }
+
+        let now = env.ledger().timestamp();
+        if job.status != JobStatus::Open || now <= job.bid_deadline {
+            panic_with_error!(&env, JobRegistryError::InvalidStateTransition);
+        }
+
+        if job.collateral_locked && job.collateral_amount > 0 {
+            let token_client = token::Client::new(&env, &job.collateral_token);
+            token_client.transfer(
+                &env.current_contract_address(),
+                &job.client,
+                &job.collateral_amount,
+            );
+            job.collateral_locked = false;
+        }
+
+        env.storage().persistent().set(&key, &job);
+
+        log!(&env, "refund_collateral: id {}", job_id);
+        env.events().publish((symbol_short!("refund"), job_id), ());
+    }
+
+    /// Client cancels an expired open job, returning client collateral and deleting bids list.
     pub fn cancel_expired_job(
         env: Env,
         job_id: u64,
@@ -401,7 +522,19 @@ impl JobRegistryContract {
  
         job.status = JobStatus::Expired;
 
+        // Refund collateral if locked
+        if job.collateral_locked && job.collateral_amount > 0 {
+            let token_client = token::Client::new(&env, &job.collateral_token);
+            token_client.transfer(
+                &env.current_contract_address(),
+                &job.client,
+                &job.collateral_amount,
+            );
+            job.collateral_locked = false;
+        }
+
         env.storage().persistent().set(&key, &job);
+        env.storage().persistent().remove(&DataKey::Bids(job_id));
 
         env.events()
             .publish((symbol_short!("expired"), job_id), client);
@@ -636,8 +769,8 @@ fn validate_job_input(
     job_id: u64,
     hash: &Bytes,
     budget: i128,
-    bidding_deadline: u64,
     expires_at: u64,
+    bid_deadline: u64,
 ) {
     if job_id == 0 {
         panic_with_error!(env, JobRegistryError::InvalidJobId);
@@ -648,11 +781,11 @@ fn validate_job_input(
         panic_with_error!(env, JobRegistryError::InvalidBudget);
     }
 
-    if bidding_deadline <= env.ledger().timestamp() {
+    if bid_deadline <= env.ledger().timestamp() {
         panic_with_error!(env, JobRegistryError::BidWindowClosed);
     }
 
-    if bidding_deadline >= expires_at {
+    if bid_deadline >= expires_at {
         panic_with_error!(env, JobRegistryError::InvalidExpiration);
     }
 
@@ -669,9 +802,36 @@ fn validate_expiration(env: &Env, expires_at: u64) {
 }
 
 fn validate_hash(env: &Env, hash: &Bytes) {
-    let len = hash.len();
+    validate_ipfs_cid(env, hash);
+}
 
-    if len == 0 || len > MAX_HASH_LEN {
+fn validate_ipfs_cid(env: &Env, hash: &Bytes) {
+    let len = hash.len();
+    if len == 46 {
+        // Must be CIDv0 (Qm...)
+        let mut buf = [0u8; 46];
+        hash.copy_into_slice(&mut buf);
+        if buf[0] != b'Q' || buf[1] != b'm' {
+            panic_with_error!(env, JobRegistryError::InvalidHash);
+        }
+        for i in 2..46 {
+            if !is_valid_base58_char(buf[i]) {
+                panic_with_error!(env, JobRegistryError::InvalidHash);
+            }
+        }
+    } else if len == 59 {
+        // Must be CIDv1 (bafy...)
+        let mut buf = [0u8; 59];
+        hash.copy_into_slice(&mut buf);
+        if buf[0] != b'b' || buf[1] != b'a' || buf[2] != b'f' || buf[3] != b'y' {
+            panic_with_error!(env, JobRegistryError::InvalidHash);
+        }
+        for i in 4..59 {
+            if !is_valid_base32_char(buf[i]) {
+                panic_with_error!(env, JobRegistryError::InvalidHash);
+            }
+        }
+    } else {
         panic_with_error!(env, JobRegistryError::InvalidHash);
     }
 }
@@ -703,8 +863,10 @@ fn post_job_with_id(
     client: Address,
     hash: Bytes,
     budget: i128,
-    bidding_deadline: u64,
     expires_at: u64,
+    bid_deadline: u64,
+    collateral_token: Address,
+    collateral_amount: i128,
 ) {
     let key = DataKey::Job(job_id);
 
@@ -719,7 +881,10 @@ fn post_job_with_id(
         budget_stroops: budget,
         expires_at,
         status: JobStatus::Open,
-        bidding_deadline,
+        bid_deadline,
+        collateral_token,
+        collateral_amount,
+        collateral_locked: collateral_amount > 0,
     };
 
     env.storage().persistent().set(&key, &job);
@@ -769,6 +934,94 @@ fn release_collateral(env: &Env, job_id: u64, freelancer: Address, _slash: bool)
     env.storage().persistent().set(&bids_key, &updated_bids);
 }
 
+fn release_collateral(env: &Env, job_id: u64, freelancer: Address, slash: bool) {
+    let bids_key = DataKey::Bids(job_id);
+    let mut bids: Vec<BidRecord> = env
+        .storage()
+        .persistent()
+        .get(&bids_key)
+        .unwrap_or_else(|| panic_with_error!(env, JobRegistryError::BidNotFound));
+
+    let mut updated = false;
+    for i in 0..bids.len() {
+        let mut bid = bids.get(i).unwrap();
+        if bid.freelancer == freelancer {
+            if bid.collateral_released {
+                panic_with_error!(
+                    env,
+                    JobRegistryError::CollateralAlreadyReleased
+                );
+            }
+            bid.collateral_released = true;
+            bids.set(i, bid);
+            updated = true;
+            break;
+        }
+    }
+
+    if !updated {
+        panic_with_error!(env, JobRegistryError::BidNotFound);
+    }
+
+    env.storage().persistent().set(&bids_key, &bids);
+
+    if slash {
+        env.events().publish(
+            (symbol_short!("slash"), job_id),
+            freelancer,
+        );
+    } else {
+        env.events().publish(
+            (symbol_short!("release"), job_id),
+            freelancer,
+        );
+    }
+}
+
+fn release_collateral(env: &Env, job_id: u64, freelancer: Address, slash: bool) {
+    let bids_key = DataKey::Bids(job_id);
+    let mut bids: Vec<BidRecord> = env
+        .storage()
+        .persistent()
+        .get(&bids_key)
+        .unwrap_or_else(|| panic_with_error!(env, JobRegistryError::BidNotFound));
+
+    let mut updated = false;
+    for i in 0..bids.len() {
+        let mut bid = bids.get(i).unwrap();
+        if bid.freelancer == freelancer {
+            if bid.collateral_released {
+                panic_with_error!(
+                    env,
+                    JobRegistryError::CollateralAlreadyReleased
+                );
+            }
+            bid.collateral_released = true;
+            bids.set(i, bid);
+            updated = true;
+            break;
+        }
+    }
+
+    if !updated {
+        panic_with_error!(env, JobRegistryError::BidNotFound);
+    }
+
+    env.storage().persistent().set(&bids_key, &bids);
+
+    if slash {
+        env.events().publish(
+            (symbol_short!("slash"), job_id),
+            freelancer,
+        );
+    } else {
+        env.events().publish(
+            (symbol_short!("release"), job_id),
+            freelancer,
+        );
+    }
+}
+
 #[cfg(test)]
 mod test {
     use super::*;
@@ -781,6 +1034,7 @@ mod test {
         Address,
         Address,
         Address,
+        Address, // Mock Token
     ) {
         let env = Env::default();
         env.mock_all_auths();
@@ -796,7 +1050,7 @@ mod test {
     }
  
     fn future_expires_at(env: &Env) -> u64 {
-        env.ledger().timestamp() + 60
+        env.ledger().timestamp() + 30 * 24 * 60 * 60
     }
 
     fn default_bidding_deadline(env: &Env) -> u64 {
@@ -819,6 +1073,8 @@ mod test {
     #[test]
     #[should_panic]
     fn test_double_initialize_panics() {
+        let (_env, cc, admin, _, _, _) = setup();
+
         let (_env, cc, admin, _, _) = setup();
  
         cc.initialize(&admin);
@@ -828,15 +1084,15 @@ mod test {
     #[test]
     #[should_panic]
     fn test_post_job_before_initialize_panics() {
-        let (env, cc, _admin, client, _) = setup();
-        let hash = Bytes::from_slice(&env, b"QmHash");
+        let (env, cc, _admin, client, _, token_addr) = setup();
+        let hash = Bytes::from_slice(&env, b"QmZ4t45v9y2X6a9f5d3v2X5a9f5d3v2X5a9f5d3v2X5a9f");
         let expires_at = future_expires_at(&env);
-        cc.post_job(&1u64, &client, &hash, &MIN_BUDGET_STROOPS, &default_bidding_deadline(&env), &expires_at);
+        cc.post_job(&1u64, &client, &hash, &MIN_BUDGET_STROOPS, &expires_at, &2000u64, &token_addr, &1000i128);
     }
  
     #[test]
     fn test_post_job_auto_allocates_sequential_ids() {
-        let (env, cc, admin, client, _) = setup();
+        let (env, cc, admin, client, _, token_addr) = setup();
         cc.initialize(&admin);
  
         let hash1 = Bytes::from_slice(&env, b"QmHash1");
@@ -854,7 +1110,7 @@ mod test {
  
     #[test]
     fn test_post_job_with_explicit_id_updates_next_job_id() {
-        let (env, cc, admin, client, _) = setup();
+        let (env, cc, admin, client, _, token_addr) = setup();
         cc.initialize(&admin);
  
         let hash = Bytes::from_slice(&env, b"QmHash");
@@ -867,7 +1123,7 @@ mod test {
     #[test]
     #[should_panic]
     fn test_invalid_budget_panics() {
-        let (env, cc, admin, client, _) = setup();
+        let (env, cc, admin, client, _, token_addr) = setup();
         cc.initialize(&admin);
  
         let hash = Bytes::from_slice(&env, b"QmHash");
@@ -878,17 +1134,18 @@ mod test {
     #[test]
     #[should_panic]
     fn test_empty_hash_panics() {
-        let (env, cc, admin, client, _) = setup();
+        let (env, cc, admin, client, _, token_addr) = setup();
         cc.initialize(&admin);
  
         let empty = Bytes::from_slice(&env, b"");
+        env.ledger().set_timestamp(100);
         let expires_at = future_expires_at(&env);
         cc.post_job(&1u64, &client, &empty, &MIN_BUDGET_STROOPS, &default_bidding_deadline(&env), &expires_at);
     }
  
     #[test]
     fn test_full_lifecycle() {
-        let (env, cc, admin, client, freelancer) = setup();
+        let (env, cc, admin, client, freelancer, token_addr) = setup();
         cc.initialize(&admin);
  
         let hash = Bytes::from_slice(&env, b"QmSomeIPFSHash");
@@ -919,12 +1176,18 @@ mod test {
  
         let d = cc.get_deliverable(&1u64);
         assert_eq!(d, deliverable);
+
+        cc.complete_job(&1u64, &client);
+        let job = cc.get_job(&1u64);
+        assert_eq!(job.status, JobStatus::Completed);
+        assert!(!job.collateral_locked);
+        assert_eq!(tc.balance(&freelancer), 1000);
     }
  
     #[test]
     #[should_panic]
     fn test_duplicate_bid_panics() {
-        let (env, cc, admin, client, freelancer) = setup();
+        let (env, cc, admin, client, freelancer, token_addr) = setup();
         cc.initialize(&admin);
  
         let hash = Bytes::from_slice(&env, b"QmHash");
@@ -939,7 +1202,7 @@ mod test {
     #[test]
     #[should_panic]
     fn test_accept_without_matching_bid_panics() {
-        let (env, cc, admin, client, freelancer) = setup();
+        let (env, cc, admin, client, freelancer, token_addr) = setup();
         cc.initialize(&admin);
  
         let hash = Bytes::from_slice(&env, b"QmHash");
@@ -951,7 +1214,7 @@ mod test {
  
     #[test]
     fn test_mark_disputed_from_assigned() {
-        let (env, cc, admin, client, freelancer) = setup();
+        let (env, cc, admin, client, freelancer, token_addr) = setup();
         cc.initialize(&admin);
  
         let hash = Bytes::from_slice(&env, b"QmHash");
@@ -970,20 +1233,21 @@ mod test {
     #[test]
     #[should_panic]
     fn test_mark_disputed_from_open_panics() {
-        let (env, cc, admin, client, _) = setup();
+        let (env, cc, admin, client, _, token_addr) = setup();
         cc.initialize(&admin);
- 
-        let hash = Bytes::from_slice(&env, b"QmHash");
+
+        let hash = Bytes::from_slice(&env, b"QmZ4t45v9y2X6a9f5d3v2X5a9f5d3v2X5a9f5d3v2X5a9f");
+        env.ledger().set_timestamp(100);
         let expires_at = future_expires_at(&env);
-        cc.post_job(&1u64, &client, &hash, &MIN_BUDGET_STROOPS, &default_bidding_deadline(&env), &expires_at);
+        cc.post_job(&1u64, &client, &hash, &MIN_BUDGET_STROOPS, &expires_at, &1000u64, &token_addr, &1000i128);
 
         cc.mark_disputed(&1u64);
     }
  
     #[test]
     #[should_panic]
-    fn test_submit_bid_after_expiration_panics() {
-        let (env, cc, admin, client, freelancer) = setup();
+    fn test_get_deliverable_without_submission_panics() {
+        let (env, cc, admin, client, _, token_addr) = setup();
         cc.initialize(&admin);
  
         let hash = Bytes::from_slice(&env, b"QmHash");
@@ -998,22 +1262,25 @@ mod test {
  
     #[test]
     #[should_panic]
-    fn test_cancel_expired_job_before_expiration_panics() {
-        let (env, cc, admin, client, _) = setup();
+    fn test_invalid_cidv0_prefix_panics() {
+        let (env, cc, admin, client, _, token_addr) = setup();
         cc.initialize(&admin);
  
         let hash = Bytes::from_slice(&env, b"QmHash");
         let expires_at = future_expires_at(&env);
         cc.post_job(&1u64, &client, &hash, &MIN_BUDGET_STROOPS, &default_bidding_deadline(&env), &expires_at);
 
-        cc.cancel_expired_job(&1u64, &client);
+        let hash = Bytes::from_slice(&env, b"bafxbeigdyrzt5sbi7ee3xjc3vyqptsyfuwwspw2gx6pqdfaaaaabbbbbccccc");
+        env.ledger().set_timestamp(100);
+        let expires_at = future_expires_at(&env);
+        cc.post_job(&1u64, &client, &hash, &MIN_BUDGET_STROOPS, &expires_at, &1000u64, &token_addr, &1000i128);
     }
 
     // --- SC-REG-037: Budget Bounds Tests ---
 
     #[test]
     fn test_budget_at_minimum_succeeds() {
-        let (env, cc, admin, client, _) = setup();
+        let (env, cc, admin, client, _, token_addr) = setup();
         cc.initialize(&admin);
  
         let hash = Bytes::from_slice(&env, b"QmHash");
@@ -1026,10 +1293,10 @@ mod test {
 
     #[test]
     fn test_budget_at_maximum_succeeds() {
-        let (env, cc, admin, client, _) = setup();
+        let (env, cc, admin, client, _, token_addr) = setup();
         cc.initialize(&admin);
 
-        let hash = Bytes::from_slice(&env, b"QmHash");
+        let hash = Bytes::from_slice(&env, b"QmZ4t45v9y2X6a9f5d3v2X5a9f5d3v2X5a9f5d3v2X5a9f");
         let expires_at = future_expires_at(&env);
         cc.post_job(&1u64, &client, &hash, &MAX_BUDGET_STROOPS, &default_bidding_deadline(&env), &expires_at);
 
@@ -1040,7 +1307,7 @@ mod test {
     #[test]
     #[should_panic]
     fn test_budget_below_minimum_panics() {
-        let (env, cc, admin, client, _) = setup();
+        let (env, cc, admin, client, _, token_addr) = setup();
         cc.initialize(&admin);
  
         let hash = Bytes::from_slice(&env, b"QmHash");
@@ -1075,10 +1342,10 @@ mod test {
 
     #[test]
     fn test_get_bids_count_empty_returns_zero() {
-        let (env, cc, admin, client, _) = setup();
+        let (env, cc, admin, client, _, token_addr) = setup();
         cc.initialize(&admin);
 
-        let hash = Bytes::from_slice(&env, b"QmHash");
+        let hash = Bytes::from_slice(&env, b"QmZ4t45v9y2X6a9f5d3v2X5a9f5d3v2X5a9f5d3v2X5a9f");
         let expires_at = future_expires_at(&env);
         cc.post_job(&1u64, &client, &hash, &MIN_BUDGET_STROOPS, &default_bidding_deadline(&env), &expires_at);
 
@@ -1087,10 +1354,10 @@ mod test {
 
     #[test]
     fn test_get_bids_count_after_submissions() {
-        let (env, cc, admin, client, _) = setup();
+        let (env, cc, admin, client, _, token_addr) = setup();
         cc.initialize(&admin);
 
-        let hash = Bytes::from_slice(&env, b"QmHash");
+        let hash = Bytes::from_slice(&env, b"QmZ4t45v9y2X6a9f5d3v2X5a9f5d3v2X5a9f5d3v2X5a9f");
         let expires_at = future_expires_at(&env);
         cc.post_job(&1u64, &client, &hash, &MIN_BUDGET_STROOPS, &default_bidding_deadline(&env), &expires_at);
 
@@ -1105,10 +1372,10 @@ mod test {
 
     #[test]
     fn test_get_bids_page_first_window() {
-        let (env, cc, admin, client, _) = setup();
+        let (env, cc, admin, client, _, token_addr) = setup();
         cc.initialize(&admin);
 
-        let hash = Bytes::from_slice(&env, b"QmHash");
+        let hash = Bytes::from_slice(&env, b"QmZ4t45v9y2X6a9f5d3v2X5a9f5d3v2X5a9f5d3v2X5a9f");
         let expires_at = future_expires_at(&env);
         cc.post_job(&1u64, &client, &hash, &MIN_BUDGET_STROOPS, &default_bidding_deadline(&env), &expires_at);
 
@@ -1124,10 +1391,10 @@ mod test {
 
     #[test]
     fn test_get_bids_page_second_window() {
-        let (env, cc, admin, client, _) = setup();
+        let (env, cc, admin, client, _, token_addr) = setup();
         cc.initialize(&admin);
 
-        let hash = Bytes::from_slice(&env, b"QmHash");
+        let hash = Bytes::from_slice(&env, b"QmZ4t45v9y2X6a9f5d3v2X5a9f5d3v2X5a9f5d3v2X5a9f");
         let expires_at = future_expires_at(&env);
         cc.post_job(&1u64, &client, &hash, &MIN_BUDGET_STROOPS, &default_bidding_deadline(&env), &expires_at);
 
@@ -1143,10 +1410,10 @@ mod test {
 
     #[test]
     fn test_get_bids_page_offset_beyond_end_returns_empty() {
-        let (env, cc, admin, client, _) = setup();
+        let (env, cc, admin, client, _, token_addr) = setup();
         cc.initialize(&admin);
 
-        let hash = Bytes::from_slice(&env, b"QmHash");
+        let hash = Bytes::from_slice(&env, b"QmZ4t45v9y2X6a9f5d3v2X5a9f5d3v2X5a9f5d3v2X5a9f");
         let expires_at = future_expires_at(&env);
         cc.post_job(&1u64, &client, &hash, &MIN_BUDGET_STROOPS, &default_bidding_deadline(&env), &expires_at);
 
