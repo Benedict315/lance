@@ -242,15 +242,22 @@ pub struct DisputeExpiredEvent {
     pub expired_at: u64,
 }
 
-fn enter_reentrancy_guard(env: &Env) {
+struct ReentrancyGuard<'a> {
+    env: &'a Env,
+}
+
+impl Drop for ReentrancyGuard<'_> {
+    fn drop(&mut self) {
+        self.env.storage().instance().remove(&DataKey::Locked);
+    }
+}
+
+fn enter_reentrancy_guard(env: &Env) -> ReentrancyGuard<'_> {
     if env.storage().instance().has(&DataKey::Locked) {
         panic_with_error!(env, EscrowError::ReentrancyDetected);
     }
     env.storage().instance().set(&DataKey::Locked, &());
-}
-
-fn exit_reentrancy_guard(env: &Env) {
-    env.storage().instance().remove(&DataKey::Locked);
+    ReentrancyGuard { env }
 }
 
 #[contract]
@@ -556,7 +563,7 @@ impl EscrowContract {
             return Err(EscrowError::AmountMismatch);
         }
 
-        enter_reentrancy_guard(&env);
+        let _guard = enter_reentrancy_guard(&env);
 
         let next_status = EscrowStatus::Funded;
         job.status.validate_transition(&next_status)?;
@@ -569,9 +576,6 @@ impl EscrowContract {
 
         log!(&env, "deposit: job {} amount {}", job_id, amount);
         env.storage().persistent().set(&key, &job);
-        Self::bump_job_ttl(&env, &key);
-
-        exit_reentrancy_guard(&env);
 
         // Emit deposit event for off-chain logging
         let evt = DepositEvent {
@@ -632,7 +636,8 @@ impl EscrowContract {
         job.status.validate_transition(&next_status)?;
         job.status = next_status;
 
-        enter_reentrancy_guard(&env);
+        let _guard = enter_reentrancy_guard(&env);
+        env.storage().persistent().set(&key, &job);
 
         let token_client = token::Client::new(&env, &job.token);
         token_client.transfer(
@@ -647,11 +652,6 @@ impl EscrowContract {
             job_id,
             milestone.amount
         );
-        env.storage().persistent().set(&key, &job);
-        Self::bump_job_ttl(&env, &key);
-
-        exit_reentrancy_guard(&env);
-
         // Emit event
         env.events().publish(
             ("escrow", "ReleaseMilestone"),
@@ -710,7 +710,8 @@ impl EscrowContract {
             .expect("invalid state transition");
         job.status = next_status;
 
-        enter_reentrancy_guard(&env);
+        let _guard = enter_reentrancy_guard(&env);
+        env.storage().persistent().set(&key, &job);
 
         let token_client = token::Client::new(&env, &job.token);
         token_client.transfer(
@@ -725,10 +726,6 @@ impl EscrowContract {
             job_id,
             milestone.amount
         );
-        env.storage().persistent().set(&key, &job);
-        Self::bump_job_ttl(&env, &key);
-
-        exit_reentrancy_guard(&env);
     }
 
     /// Either party opens a dispute, locking remaining funds.
@@ -876,7 +873,8 @@ impl EscrowContract {
             .expect("released amount overflow");
         job.status = next_status;
 
-        enter_reentrancy_guard(&env);
+        let _guard = enter_reentrancy_guard(&env);
+        env.storage().persistent().set(&key, &job);
 
         let token_client = token::Client::new(&env, &job.token);
         if payee_amount > 0 {
@@ -897,10 +895,6 @@ impl EscrowContract {
             payee_amount,
             payer_amount
         );
-        env.storage().persistent().set(&key, &job);
-        Self::bump_job_ttl(&env, &key);
-
-        exit_reentrancy_guard(&env);
     }
 
     /// Client recoups funds if freelancer never responded or deadline has passed.
@@ -930,7 +924,8 @@ impl EscrowContract {
         job.released_amount = job.total_amount;
         job.status = next_status;
 
-        enter_reentrancy_guard(&env);
+        let _guard = enter_reentrancy_guard(&env);
+        env.storage().persistent().set(&key, &job);
 
         if remaining > 0 {
             let token_client = token::Client::new(&env, &job.token);
@@ -938,10 +933,6 @@ impl EscrowContract {
         }
 
         log!(&env, "refund: job {} amount {}", job_id, remaining);
-        env.storage().persistent().set(&key, &job);
-        Self::bump_job_ttl(&env, &key);
-
-        exit_reentrancy_guard(&env);
 
         env.events().publish(
             ("escrow", "Refunded"),
@@ -985,16 +976,13 @@ impl EscrowContract {
         job.released_amount = job.total_amount;
         job.status = next_status;
 
-        enter_reentrancy_guard(&env);
+        let _guard = enter_reentrancy_guard(&env);
+        env.storage().persistent().set(&key, &job);
 
         if remaining > 0 {
             let token_client = token::Client::new(&env, &job.token);
             token_client.transfer(&env.current_contract_address(), &job.client, &remaining);
         }
-
-        env.storage().persistent().set(&key, &job);
-        Self::bump_job_ttl(&env, &key);
-        exit_reentrancy_guard(&env);
 
         env.events().publish(
             ("escrow", "BriefCanceled"),
@@ -1084,7 +1072,8 @@ impl EscrowContract {
         job.released_amount = job.total_amount;
         job.status = next_status;
 
-        enter_reentrancy_guard(&env);
+        let _guard = enter_reentrancy_guard(&env);
+        env.storage().persistent().set(&key, &job);
 
         if remaining > 0 {
             let token_client = token::Client::new(&env, &job.token);
@@ -1097,11 +1086,6 @@ impl EscrowContract {
             job_id,
             remaining
         );
-        env.storage().persistent().set(&key, &job);
-        Self::bump_job_ttl(&env, &key);
-
-        exit_reentrancy_guard(&env);
-
         env.events().publish(
             ("escrow", "DisputeExpired"),
             DisputeExpiredEvent {
@@ -2577,6 +2561,90 @@ mod test {
         let job = cc.get_job(&1u64);
         assert_eq!(job.released_amount, job.total_amount);
         assert_eq!(job.released_amount, tc.balance(&freelancer));
+    }
+
+    #[test]
+    #[should_panic(expected = "Error(Contract, #12)")]
+    fn test_reentrant_release_milestone_panics() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let admin = Address::generate(&env);
+        let agent_judge = Address::generate(&env);
+        let client = Address::generate(&env);
+        let freelancer = Address::generate(&env);
+
+        let token_addr = setup_token(&env, &admin);
+        mint(&env, &token_addr, &client);
+
+        let contract_id = env.register_contract(None, EscrowContract);
+        let cc = EscrowContractClient::new(&env, &contract_id);
+
+        cc.initialize(&admin, &agent_judge);
+        cc.create_job(&1u64, &client, &freelancer, &token_addr);
+        cc.add_milestone(&1u64, &5000i128);
+        cc.deposit(&1u64, &5000i128);
+
+        env.as_contract(&contract_id, || {
+            env.storage().instance().set(&DataKey::Locked, &());
+        });
+        cc.release_milestone(&1u64, &client);
+    }
+
+    #[test]
+    #[should_panic(expected = "Error(Contract, #12)")]
+    fn test_reentrant_release_funds_panics() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let admin = Address::generate(&env);
+        let agent_judge = Address::generate(&env);
+        let client = Address::generate(&env);
+        let freelancer = Address::generate(&env);
+
+        let token_addr = setup_token(&env, &admin);
+        mint(&env, &token_addr, &client);
+
+        let contract_id = env.register_contract(None, EscrowContract);
+        let cc = EscrowContractClient::new(&env, &contract_id);
+
+        cc.initialize(&admin, &agent_judge);
+        cc.create_job(&1u64, &client, &freelancer, &token_addr);
+        cc.add_milestone(&1u64, &5000i128);
+        cc.deposit(&1u64, &5000i128);
+
+        env.as_contract(&contract_id, || {
+            env.storage().instance().set(&DataKey::Locked, &());
+        });
+        cc.release_funds(&1u64, &client, &0u32);
+    }
+
+    #[test]
+    #[should_panic(expected = "Error(Contract, #12)")]
+    fn test_reentrant_refund_panics() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let admin = Address::generate(&env);
+        let agent_judge = Address::generate(&env);
+        let client = Address::generate(&env);
+        let freelancer = Address::generate(&env);
+
+        let token_addr = setup_token(&env, &admin);
+        mint(&env, &token_addr, &client);
+
+        let contract_id = env.register_contract(None, EscrowContract);
+        let cc = EscrowContractClient::new(&env, &contract_id);
+
+        cc.initialize(&admin, &agent_judge);
+        cc.create_job(&1u64, &client, &freelancer, &token_addr);
+        cc.add_milestone(&1u64, &5000i128);
+        cc.deposit(&1u64, &5000i128);
+
+        env.as_contract(&contract_id, || {
+            env.storage().instance().set(&DataKey::Locked, &());
+        });
+        cc.refund(&1u64, &client);
     }
 
     // ─────────────────────────────────────────────────────────────────────────
