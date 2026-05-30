@@ -520,6 +520,14 @@
                         "symbol": "metadata_hash"
                       },
                       "val": "void"
+                    },
+                    {
+                      "key": {
+                        "symbol": "transfer_blocked"
+                      },
+                      "val": {
+                        "bool": true
+                      }
                     }
                   ]
                 }
@@ -1794,7 +1802,7 @@
                     "symbol": "badge_level"
                   },
                   "val": {
-                    "u32": 1
+                    "u32": 4
                   }
                 },
                 {
@@ -2086,7 +2094,7 @@
                     "symbol": "badge_level"
                   },
                   "val": {
-                    "u32": 1
+                    "u32": 4
                   }
                 },
                 {
@@ -2378,7 +2386,7 @@
                     "symbol": "badge_level"
                   },
                   "val": {
-                    "u32": 2
+                    "u32": 4
                   }
                 },
                 {

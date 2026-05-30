@@ -254,7 +254,7 @@
                               "symbol": "badge_level"
                             },
                             "val": {
-                              "u32": 0
+                              "u32": 1
                             }
                           },
                           {
@@ -323,7 +323,7 @@
                               "symbol": "badge_level"
                             },
                             "val": {
-                              "u32": 1
+                              "u32": 3
                             }
                           },
                           {
@@ -394,6 +394,14 @@
                         "symbol": "metadata_hash"
                       },
                       "val": "void"
+                    },
+                    {
+                      "key": {
+                        "symbol": "transfer_blocked"
+                      },
+                      "val": {
+                        "bool": true
+                      }
                     }
                   ]
                 }
@@ -1176,7 +1184,7 @@
                     "symbol": "badge_level"
                   },
                   "val": {
-                    "u32": 1
+                    "u32": 4
                   }
                 },
                 {
@@ -1426,7 +1434,7 @@
                     "symbol": "badge_level"
                   },
                   "val": {
-                    "u32": 1
+                    "u32": 3
                   }
                 },
                 {
@@ -1589,7 +1597,7 @@
                     "symbol": "badge_level"
                   },
                   "val": {
-                    "u32": 1
+                    "u32": 3
                   }
                 },
                 {
