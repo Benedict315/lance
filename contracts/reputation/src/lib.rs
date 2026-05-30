@@ -1,4 +1,4 @@
-﻿#![no_std]
+#![no_std]
 
 use soroban_sdk::{
     contract, contracterror, contractimpl, contracttype, Address, Bytes, BytesN, Env, IntoVal,
@@ -536,6 +536,84 @@ impl ReputationContract {
                 blacklisted: profile.is_blacklisted,
                 updated_at: env.ledger().timestamp(),
             },
+        let is_blacklisted = profile.is_blacklisted;
+        let metrics = Self::role_metrics_mut(&mut profile, &role);
+        let previous_score = metrics.score;
+        metrics.completed_jobs = metrics.completed_jobs.saturating_add(1);
+        Self::apply_manual_delta(metrics, delta, is_blacklisted);
+        let new_score = metrics.score;
+        let total_jobs = metrics.completed_jobs;
+        let badge_level = metrics.badge_level;
+
+        storage::write_profile(&env, &address, &profile);
+        env.events().publish(
+            ("reputation", "ScoreAdjusted"),
+            ScoreAdjustedEvent {
+                address,
+                role,
+                delta: new_score.saturating_sub(previous_score),
+                new_score,
+                total_jobs,
+                badge_level,
+                adjusted_at: env.ledger().timestamp(),
+            },
+        // Calculate new average rating using fixed-point arithmetic
+        profile.avg_rating = fixed_point::calculate_avg_rating(
+            profile.total_review_points,
+            profile.review_count,
+        );
+
+        let mut profile = storage::read_profile_or_default(&env, &address);
+        if profile.is_blacklisted {
+            soroban_sdk::panic_with_error!(&env, ReputationError::Blacklisted);
+        }
+
+        let is_blacklisted = profile.is_blacklisted;
+        let metrics = Self::role_metrics_mut(&mut profile, &role);
+        let previous_score = metrics.score;
+        Self::apply_role_decay(&env, metrics, Self::SLASH_DECAY_BPS, is_blacklisted);
+        let new_score = metrics.score;
+        let total_jobs = metrics.completed_jobs;
+        let badge_level = metrics.badge_level;
+
+        storage::write_profile(&env, &address, &profile);
+        env.events().publish(
+            ("reputation", "ScoreAdjusted"),
+            ScoreAdjustedEvent {
+                address,
+                role,
+                delta: new_score.saturating_sub(previous_score),
+                new_score,
+                total_jobs,
+                badge_level,
+                adjusted_at: env.ledger().timestamp(),
+            },
+        // Update reputation score based on average rating
+        // Scale: 1->2000 BPS, 2->4000 BPS, ..., 5->10000 BPS
+        let rating_bps = (profile.avg_rating * 2) / 1000; // Convert from 1000-5000 scale to 2000-10000 BPS
+        profile.reputation_score = rating_bps.clamp(0, 10_000);
+
+        // Update timestamp
+        profile.last_updated = env.ledger().timestamp();
+
+        // Check and update badge tier
+        let new_tier = Self::calculate_badge_tier(profile.reputation_score, profile.completed_jobs);
+        profile.badge_tier = new_tier;
+
+        // Save updated profile
+        Self::save_profile(env.clone(), &profile);
+
+        // Also update legacy ReputationScore for backward compatibility
+        let mut rep = Self::get_score(env.clone(), target.clone(), Role::Freelancer);
+        rep.total_points = rep.total_points.saturating_add(score as i32);
+        rep.reviews = rep.reviews.saturating_add(1);
+        rep.total_jobs = rep.total_jobs.saturating_add(1);
+        let avg = rep.total_points / (rep.reviews as i32);
+        let bps = avg.saturating_mul(2000);
+        rep.score = bps.clamp(0, 10_000);
+        env.storage().persistent().set(
+            &DataKey::Score(rep.address.clone(), rep.role.clone()),
+            &rep,
         );
         Self::bump_instance_ttl(&env);
     }
@@ -859,6 +937,50 @@ impl ReputationContract {
             });
         }
         results
+    pub fn get_badge(env: Env, address: Address, role: Role) -> BadgeLevel {
+        Self::bump_instance_ttl(&env);
+        let profile = storage::read_profile_or_default(&env, &address);
+        let score = Self::role_metrics(&profile, &role).score;
+        BadgeLevel::from_score(score)
+    }
+
+    pub fn set_badge_metadata(
+        env: Env,
+        admin: Address,
+        address: Address,
+        tier: BadgeTier,
+        uri: Bytes,
+    ) {
+        Self::require_admin(&env, &admin);
+        let mut profile = storage::read_profile_or_default(&env, &address);
+        
+        let mut updated = false;
+        for i in 0..profile.badge_metadata.len() {
+            if let Some(mut entry) = profile.badge_metadata.get(i) {
+                if entry.tier == tier {
+                    entry.uri = uri.clone();
+                    profile.badge_metadata.set(i, entry);
+                    updated = true;
+                    break;
+                }
+            }
+        }
+        if !updated {
+            profile.badge_metadata.push_back(BadgeMetadataEntry { tier, uri });
+        }
+        storage::write_profile(&env, &address, &profile);
+        Self::bump_instance_ttl(&env);
+    }
+
+    pub fn get_badge_metadata(env: Env, address: Address, tier: BadgeTier) -> Option<Bytes> {
+        Self::bump_instance_ttl(&env);
+        let profile = storage::read_profile_or_default(&env, &address);
+        for entry in profile.badge_metadata.iter() {
+            if entry.tier == tier {
+                return Some(entry.uri);
+            }
+        }
+        None
     }
 }
 
@@ -1440,6 +1562,16 @@ mod test {
 
         client.update_score(&admin, &address, &Role::Freelancer, &500);
         assert_eq!(client.get_badge_level(&address, &Role::Freelancer), 0);
+        let uri = Bytes::from_slice(&env, b"ipfs://QmBronzeBadge");
+        client.set_badge_metadata(&admin, &addr, &BadgeTier::Bronze, &uri);
+
+        let result = client.get_badge_metadata(&addr, &BadgeTier::Bronze);
+        assert_eq!(result, Some(uri));
+        client.slash(
+            &address,
+            &Role::Client,
+            &soroban_sdk::Symbol::new(&env, "fraud"),
+        );
 
         client.update_score(&admin, &address, &Role::Freelancer, &500);
         assert_eq!(client.get_badge_level(&address, &Role::Freelancer), 0);
@@ -1499,6 +1631,11 @@ mod test {
         let contract_id = env.register_contract(None, ReputationContract);
         let client = ReputationContractClient::new(&env, &contract_id);
         client.initialize(&admin);
+        let uri_v1 = Bytes::from_slice(&env, b"ipfs://QmSilverV1");
+        let uri_v2 = Bytes::from_slice(&env, b"ipfs://QmSilverV2");
+        client.set_badge_metadata(&admin, &addr, &BadgeTier::Silver, &uri_v1);
+        client.set_badge_metadata(&admin, &addr, &BadgeTier::Silver, &uri_v2);
+        env.mock_all_auths_allow_last();
 
         let mock_id = env.register_contract(None, MockJobRegistry);
         client.set_job_registry(&admin, &mock_id);
@@ -1538,6 +1675,24 @@ mod test {
     fn test_profile_exists_returns_true_after_rating() {
         let env = Env::default();
         env.mock_all_auths();
+    fn test_multiple_tiers_stored_independently() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let admin = Address::generate(&env);
+        let addr = Address::generate(&env);
+        let cid = env.register_contract(None, ReputationContract);
+        let client = ReputationContractClient::new(&env, &cid);
+        client.initialize(&admin);
+        let bronze_uri = Bytes::from_slice(&env, b"ipfs://Bronze");
+        let gold_uri   = Bytes::from_slice(&env, b"ipfs://Gold");
+        client.set_badge_metadata(&admin, &addr, &BadgeTier::Bronze, &bronze_uri);
+        client.set_badge_metadata(&admin, &addr, &BadgeTier::Gold,   &gold_uri);
+    fn test_fixed_point_arithmetic() {
+        // Test fixed-point arithmetic for safe rating calculations
+        
+        // Test calculate_avg_rating
+        let avg_rating = fixed_point::calculate_avg_rating(15000, 3); // 15000/3 = 5000 = 5.0
+        assert_eq!(avg_rating, 5000);
 
         let admin = Address::generate(&env);
         let job_client = Address::generate(&env);
