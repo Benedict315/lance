@@ -296,11 +296,7 @@ impl JobRegistryContract {
             }
         }
  
-        let bid_count = read_bid_count(&env, job_id);
-        let next_count = bid_count
-            .checked_add(1)
-            .unwrap_or_else(|| panic_with_error!(&env, JobRegistryError::Overflow));
-        let bid = BidRecord {
+        bids.push_back(BidRecord {
             freelancer: freelancer.clone(),
             proposal_hash,
             collateral_stroops,
